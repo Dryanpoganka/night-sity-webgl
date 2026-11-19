@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Город ночью</title>
+  <meta name="description" content="Процедурный ночной мегаполис сверху: пролёт камеры по прокрутке страницы.">
+  <meta name="theme-color" content="#0b1020">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="hero">
+    <p class="eyebrow">Процедурная сцена</p>
+    <h1>Город ночью</h1>
+    <p class="lede">Мегаполис, нарисованный одними формулами: кольца, проспекты, река и тысячи огней — от высоты тридцати километров до крыш над проспектом.</p>
+    <p class="hint" aria-hidden="true"><span>Прокрутите вниз</span><i></i></p>
+  </header>
+
+  <section class="scrolly" id="scene" aria-label="Пролёт над ночным городом">
+    <div class="stage" data-step="0">
+      <canvas id="city" aria-hidden="true"></canvas>
+      <div class="fallback" aria-hidden="true">
+        <p>Здесь должен быть ночной город. Браузер не поддерживает WebGL2 — показан упрощённый вид.</p>
+      </div>
+
+      <div class="captions">
+        <article class="cap" data-step="0">
+          <p class="cap-label">Высота 29 км</p>
+          <h2>Мегаполис</h2>
+          <p class="cap-text">Сверху город — это схема: четыре кольца, четырнадцать проспектов и река, которая проходит через самый центр.</p>
+          <div class="cap-meta"><span class="count">01 / 04</span><span class="bar"><i></i></span></div>
+        </article>
+        <article class="cap" data-step="1">
+          <p class="cap-label">Высота 6 км</p>
+          <h2>Кольца</h2>
+          <p class="cap-text">Кольца на 1,3, 2,3 и 5,5 км держат центр, внешнее проходит на 17,5 км. Камера медленно облетает центр.</p>
+          <div class="cap-meta"><span class="count">02 / 04</span><span class="bar"><i></i></span></div>
+        </article>
+        <article class="cap" data-step="2">
+          <p class="cap-label">Высота 1,5 км</p>
+          <h2>Река</h2>
+          <p class="cap-text">Над рекой поднимаются кварталы и башни центра. По набережным тянутся цепочки фонарей, а тёмная вода повторяет их дрожащими отражениями.</p>
+          <div class="cap-meta"><span class="count">03 / 04</span><span class="bar"><i></i></span></div>
+        </article>
+        <article class="cap" data-step="3">
+          <p class="cap-label">Высота 300 м</p>
+          <h2>Проспект</h2>
+          <p class="cap-text">Между рядами домов проспект распадается на огни: белые фары едут в одну сторону, красные стоп-сигналы — в другую.</p>
+          <div class="cap-meta"><span class="count">04 / 04</span><span class="bar"><i></i></span></div>
+        </article>
+      </div>
+
+      <nav class="dots" aria-label="Шаги сцены">
+        <button type="button" aria-label="Шаг 1: Мегаполис"></button>
+        <button type="button" aria-label="Шаг 2: Кольца"></button>
+        <button type="button" aria-label="Шаг 3: Река"></button>
+        <button type="button" aria-label="Шаг 4: Проспект"></button>
+      </nav>
+      <button type="button" class="skip">Пропустить</button>
+    </div>
+
+    <div class="steps" aria-hidden="true">
+      <div class="step" data-step="0"></div>
+      <div class="step" data-step="1"></div>
+      <div class="step" data-step="2"></div>
+      <div class="step" data-step="3"></div>
+      <div class="tail"></div>
+    </div>
+  </section>
+
+  <section class="outro" id="after">
+    <h2>Всё это — формулы</h2>
+    <p>Ни одной картинки и ни одной модели: каждый пиксель считается заново из плана города, времени и положения камеры. Огни не мерцают, потому что каждый узор знает, сколько земли помещается в пиксель.</p>
+    <p class="small">Шейдер WebGL2 · ES-модули · без библиотек</p>
+  </section>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
