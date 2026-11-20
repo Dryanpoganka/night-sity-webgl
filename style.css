@@ -225,6 +225,19 @@ body {
     linear-gradient(var(--bg), #0e1630 50%, var(--bg));
   transition: background .8s ease;
 }
+/* кадры шагов (запасной вид без WebGL2 или для слишком слабых устройств) — кроссфейд по шагам */
+.fallback .shot {
+  position: absolute;
+  inset: 0;
+  background: center / cover no-repeat;
+  opacity: 0;
+  transition: opacity .9s ease;
+}
+.stage[data-step="0"] .shot[data-step="0"],
+.stage[data-step="1"] .shot[data-step="1"],
+.stage[data-step="2"] .shot[data-step="2"],
+.stage[data-step="3"] .shot[data-step="3"] { opacity: 1; }
+.fallback.has-shots p { position: relative; z-index: 1; text-shadow: 0 1px 12px rgba(11, 16, 32, .9); }
 .fallback p { max-width: 22em; margin: 0; font-size: 14px; color: var(--muted); text-align: right; }
 .stage.no-webgl .fallback { display: flex; }
 .stage.no-webgl #city { visibility: hidden; }

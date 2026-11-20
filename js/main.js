@@ -1,4 +1,5 @@
-import { create } from './gl-scene.js';
+import { create, createProgram, VS } from './gl-scene.js';
+import { makeNoiseData, NOISE_SIZE } from './noise-tex.js';
 import { CITY_FS } from './city-shader.js';
 import { createCameraRig } from './camera.js';
 
@@ -98,18 +99,133 @@ let fade = 0;
 let clock = 0;
 
 const UNIFORMS = ['uRes', 'uTime', 'uCamPos', 'uCamR', 'uCamU', 'uCamF', 'uTanH', 'uAve', 'uExpo',
-  'uFade', 'uVig', 'uLod', 'uSide', 'uBgSrgb', 'uGold', 'uBlue', 'uLight', 'uFlash', 'uBuild', 'uSteps', 'uBRad'];
+  'uFade', 'uVig', 'uLod', 'uSide', 'uBgSrgb', 'uGold', 'uBlue', 'uLight', 'uFlash', 'uBuild', 'uSteps', 'uBRad',
+  'uNoise', 'uCity'];
+
+const DEBUG = new URLSearchParams(location.search).has('debug');
+const hooks = {};
+
+// ?debug&def=A,B — отладочные #define (выключение частей шейдера для замеров), ?debug&lite — сразу облегчённый шейдер
+const withDefs = (src, defs) => (defs.length
+  ? src.replace('#version 300 es\n', '#version 300 es\n' + defs.map((d) => `#define ${d.replace(/[^A-Z0-9_]/gi, '')}\n`).join(''))
+  : src);
+const DEFS = DEBUG ? (new URLSearchParams(location.search).get('def') || '').split(',').filter(Boolean) : [];
+if (DEBUG && new URLSearchParams(location.search).has('lite')) DEFS.push('LITE');
+const FS = withDefs(CITY_FS, DEFS);
+
+// ---------------------------------------------------------------- текстуры: хеши и карта города
+// Текстура хешей заменяет целочисленные хеши и value-noise. Карта города (плотность, парки,
+// расстояние до дорог) запекается один раз при старте тем же шейдером с #define BAKE —
+// обход кварталов берёт её одной выборкой вместо шума и расчёта расстояний на каждый квартал.
+const CITY_RES = 1024;
+let texNoise = null, texCity = null;
+
+async function prepareTextures(gl) {
+  texNoise = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, texNoise);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, NOISE_SIZE, NOISE_SIZE, 0, gl.RGBA, gl.UNSIGNED_BYTE, makeNoiseData());
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+
+  texCity = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, texCity);
+  gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, CITY_RES, CITY_RES);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  const bake = await createProgram(gl, VS, withDefs(CITY_FS, ['BAKE']));
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texCity, 0);
+  gl.viewport(0, 0, CITY_RES, CITY_RES);
+  gl.useProgram(bake);
+  gl.uniform1fv(gl.getUniformLocation(bake, 'uAve'), avenues);
+  gl.uniform1i(gl.getUniformLocation(bake, 'uNoise'), 0);
+  gl.uniform1i(gl.getUniformLocation(bake, 'uCity'), 2);   // в запекании не читается
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, null);                     // не читать текстуру, в которую пишем
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.deleteFramebuffer(fbo);
+  gl.deleteProgram(bake);
+  gl.bindTexture(gl.TEXTURE_2D, texCity);
+  gl.activeTexture(gl.TEXTURE0);
+}
+
+// ---------------------------------------------------------------- статичный запасной вид
+// Без WebGL2 или если даже облегчённый шейдер не успевает — кадры шагов из docs/frames/ с кроссфейдом.
+const SHOTS = [1, 2, 3, 4].map((i) => `docs/frames/step-${i}.jpg`);
+let shotsReady = false;
+let staticMode = false;
+function showStaticFallback(reason) {
+  if (reason === 'too-slow') staticMode = true;
+  if (shotsReady) return;
+  shotsReady = true;
+  const fb = $('.fallback');
+  if (!fb) return;
+  SHOTS.forEach((src, i) => {
+    const d = document.createElement('div');
+    d.className = 'shot';
+    d.dataset.step = String(i);
+    d.style.backgroundImage = `url("${src}")`;
+    fb.prepend(d);
+  });
+  fb.classList.add('has-shots');
+  const p = $('p', fb);
+  if (p) {
+    p.textContent = reason === 'too-slow'
+      ? 'Устройство не успевает рисовать сцену плавно — показаны кадры пролёта.'
+      : 'Браузер не поддерживает WebGL2 — показаны кадры пролёта.';
+  }
+}
+
+// ---------------------------------------------------------------- уровни деталей
+// lod 2 — всё; 1 — меньше шагов и радиус домов, без звёзд и искр; 0 — минимум, без «дыхания»,
+// в простое кадры не рисуются. Слабые устройства (телефон, встроенная графика) не строят дома выше 4 км.
+const LOD_STEPS = [0.5, 0.72, 1];
+const LOD_RAD = [0.6, 0.8, 1];
 
 const scene = create(canvas, {
-  fragment: CITY_FS,
+  hooks,
+  forceWeak: DEBUG && new URLSearchParams(location.search).get('profile') === 'weak',
+  fragment: FS,
   uniformNames: UNIFORMS,
   mobile,
   reducedMotion,
-  onFallback(onFlag) { stage.classList.toggle('no-webgl', !!onFlag); },
+  async onReady(gl) {
+    try {
+      await prepareTextures(gl);
+    } catch (e) {
+      console.error(e.message || e);
+      stage.classList.add('no-webgl');
+      showStaticFallback();
+    }
+    scene.invalidate && scene.invalidate();
+  },
+  onFallback(onFlag, reason) {
+    if (staticMode) return;   // статичный вид включён окончательно
+    stage.classList.toggle('no-webgl', !!onFlag);
+    if (onFlag) showStaticFallback(reason);
+  },
+  onLite: () => withDefs(CITY_FS, [...DEFS, 'LITE']),
+  idleFps: (st) => (st.lod === 0 ? 0 : (mobile || st.weak ? 30 : 60)),
   render(gl, u, time, dt, st) {
     clock = time;
     const aspect = st.width / st.height;
-    const cam = rig.update(dt, time, st.progress, pointer, aspect);
+    const cam = rig.update(dt, time, st.progress, pointer, aspect, st.lod === 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, texCity);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texNoise);
+    gl.uniform1i(u.uNoise, 0);
+    gl.uniform1i(u.uCity, 1);
     gl.uniform2f(u.uRes, st.width, st.height);
     gl.uniform1f(u.uTime, time % 100000);
     gl.uniform3fv(u.uCamPos, cam.pos);
@@ -128,11 +244,14 @@ const scene = create(canvas, {
     gl.uniform3fv(u.uGold, PAL.gold);
     gl.uniform3fv(u.uBlue, PAL.blue);
     gl.uniform3fv(u.uLight, PAL.light);
-    // здания: выключены выше 8 км (там хватает плоского плана), в полную высоту — ниже 2 км
-    const hk = Math.min(1, Math.max(0, (cam.pos[1] - 2) / 6));
+    // здания: на мощной графике выключены выше 8 км и в полную высоту ниже 2 км;
+    // на слабой — выключены выше 4 км и в полную высоту ниже 1.5 км
+    const hk = st.weak
+      ? Math.min(1, Math.max(0, (cam.pos[1] - 1.5) / 2.5))
+      : Math.min(1, Math.max(0, (cam.pos[1] - 2) / 6));
     gl.uniform1f(u.uBuild, 1 - hk * hk * (3 - 2 * hk));
-    gl.uniform1f(u.uSteps, (mobile ? 40 : 68) * (st.lod ? 1 : 0.6));
-    gl.uniform1f(u.uBRad, mobile ? 3.4 : 4.8);
+    gl.uniform1f(u.uSteps, Math.round((mobile ? 40 : (st.weak ? 52 : 68)) * LOD_STEPS[st.lod]));
+    gl.uniform1f(u.uBRad, (mobile ? 3.4 : 4.8) * LOD_RAD[st.lod]);
     const ft = (performance.now() - flash.t0) / 1000;
     const fl = ft < 0.35 ? 1 - ft / 0.35 : 0;
     const k = st.width / st.cssW;
@@ -232,3 +351,18 @@ stage.addEventListener('pointerdown', (e) => {
   scene.invalidate();
 });
 
+// ---------------------------------------------------------------- отладка (?debug)
+if (DEBUG && new URLSearchParams(location.search).has('static')) {
+  scene.setPaused(true);
+  stage.classList.add('no-webgl');
+  showStaticFallback('too-slow');
+}
+if (DEBUG && scene.ok) {
+  import('./debug.js').then(({ attachDebug }) => attachDebug(scene, hooks, () => ({
+    step: String(active + 1),
+    progress: rig.progress.toFixed(3),
+    mobile: String(mobile),
+    weak: String(scene.state.weak),
+    tier: scene.state.tier,
+  })));
+}

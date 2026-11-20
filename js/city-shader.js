@@ -6,6 +6,14 @@ export const CITY_FS = /* glsl */ `#version 300 es
 precision highp float;
 precision highp int;
 
+// LITE — облегчённый вариант для самых слабых устройств: плоский город без домов, машин, звёзд и искр.
+#ifdef LITE
+#define ABL_BUILD
+#define ABL_CARS
+#define ABL_STARS
+#define NO_SPARKS
+#endif
+
 uniform vec2  uRes;
 uniform float uTime;
 uniform vec3  uCamPos;
@@ -17,7 +25,7 @@ uniform float uAve[14];   // углы радиальных проспектов,
 uniform float uExpo;
 uniform float uFade;      // 0 — сцена видна, 1 — полностью цвет фона
 uniform float uVig;
-uniform float uLod;       // 1 — полный набор деталей, 0 — облегчённый
+uniform float uLod;       // уровень деталей: 2 — полный, 1 — без звёзд и искр, 0 — минимальный
 uniform float uSide;      // 1 — растушёвка и по бокам (узкий экран)
 uniform vec3  uBgSrgb;    // цвет фона страницы, sRGB
 uniform vec3  uGold;      // линейные
@@ -27,6 +35,9 @@ uniform vec3  uFlash;     // x, y — пиксели холста, z — сил�
 uniform float uBuild;     // 0..1 — масштаб высоты зданий (0 — плоский город)
 uniform float uSteps;     // лимит шагов обхода кварталов
 uniform float uBRad;      // базовый радиус зданий вокруг камеры, км
+uniform highp sampler2D uNoise;   // 512×512 RGBA8: R — h2(x−256, y−256), G, B, A — независимые хеши
+uniform highp sampler2D uCity;    // 1024×1024 карта города ±24 км: плотность, парк, расстояние до дорог
+const float CITY_EXT = 24.0;
 
 out vec4 outColor;
 
@@ -48,14 +59,15 @@ float h2(int a, int b) {
   uint x = hu(uint(a + 1048576) * 0x9E3779B1U ^ hu(uint(b + 1048576)));
   return float(x >> 8) * (1.0 / 16777216.0);
 }
+// Value noise: одна билинейная выборка по сдвинутым на smoothstep координатам
+// даёт ту же гладкую интерполяцию, что и четыре хеша с mix.
 float vnoise(vec2 p) {
   vec2 i = floor(p), f = fract(p);
   f = f * f * (3.0 - 2.0 * f);
-  ivec2 c = ivec2(i);
-  float a = h2(c.x, c.y),     b = h2(c.x + 1, c.y);
-  float d = h2(c.x, c.y + 1), e = h2(c.x + 1, c.y + 1);
-  return mix(mix(a, b, f.x), mix(d, e, f.x), f.y);
+  return textureLod(uNoise, (i + f + 256.5) * (1.0 / 512.0), 0.0).r;
 }
+// Дешёвый хеш целочисленной пары — выборка из той же текстуры (период 512).
+vec4 th(int a, int b) { return texelFetch(uNoise, ivec2(a & 511, b & 511), 0); }
 
 // ---------------------------------------------------------------- фильтры
 vec2 gDx, gDy; // размер пикселя на плоскости (ray differentials)
@@ -99,18 +111,20 @@ float lightGrid(float al, float ac, float L, float T, float fwal, float fwac, fl
 }
 // Машины одной полосы: позиция = (вдоль − время·скорость) / шаг, часть ячеек пустая.
 float carLane(float al, float ac, float L, float v, float fwal, float fwac, float s0, int seed) {
-  float x = al - v * uTime;
-  float cell = floor(x / L);
-  int ci = int(cell);
-  float present = step(0.38, h2(ci, seed));
-  float jit = (h2(ci, seed + 7) - 0.5) * 0.5 * L;
-  float da = x - (cell + 0.5) * L - jit;
-  float sa = sqrt(s0 * s0 + 0.09 * fwal * fwal);
   float sc = sqrt(s0 * s0 + 0.09 * fwac * fwac);
   float g = exp(-0.5 * ac * ac / (sc * sc));
-  float disc = present * (s0 * s0 / (sa * sc)) * exp(-0.5 * da * da / (sa * sa)) * g;
   float line = 0.62 * (s0 * s0 * 2.5066 / (sc * L)) * g;
-  return mix(disc, line, smoothstep(0.2 * L, 0.7 * L, fwal));
+  float k = smoothstep(0.2 * L, 0.7 * L, fwal);
+  if (k >= 1.0 || g < 1e-4) return line * step(1e-4, g);
+  float x = al - v * uTime;
+  float cell = floor(x / L);
+  vec4 hh = th(int(cell), seed);
+  float present = step(0.38, hh.g);
+  float jit = (hh.b - 0.5) * 0.5 * L;
+  float da = x - (cell + 0.5) * L - jit;
+  float sa = sqrt(s0 * s0 + 0.09 * fwal * fwal);
+  float disc = present * (s0 * s0 / (sa * sc)) * exp(-0.5 * da * da / (sa * sa)) * g;
+  return mix(disc, line, k);
 }
 // Мягкий ореол вокруг линии (гаусс поперёк, нормированный по энергии).
 float halo(float d, float s0, float fw) {
@@ -154,7 +168,9 @@ float stars(vec3 rd) {
 }
 vec3 sky(vec3 rd) {
   vec3 c = skyBase(rd);
+#ifndef ABL_STARS
   if (uLod > 0.5) c += vec3(0.85, 0.88, 1.0) * stars(rd);
+#endif
   return c;
 }
 
@@ -164,7 +180,8 @@ float riverDF(float x) { return 0.304 * cos(0.38 * x) + 0.275 * cos(1.1 * x); }
 
 // ---------------------------------------------------------------- сетка кварталов
 // Одна и та же сетка используется плоским городом и зданиями — совпадение по построению.
-struct Grid { int gid; float T; vec2 eu; vec2 ev; vec2 off; };
+// nS, nE — нормали к лучам-границам сектора, r0..r1 — кольцевая полоса: проверка «точка в этой сетке» без atan.
+struct Grid { int gid; float T; vec2 eu; vec2 ev; vec2 off; vec2 nS; vec2 nE; float r0; float r1; };
 
 int gidAt(vec2 p) {
   float r = length(p);
@@ -180,16 +197,27 @@ Grid gridFor(int gid) {
   G.gid = gid;
   G.T = mix(0.085, 0.14, h2(gid, 17));
   float ang = 0.35;
+  G.nS = vec2(0.0); G.nE = vec2(0.0); G.r0 = 0.0; G.r1 = 1.3;
   if (gid != 997) {
     int s = gid % NAVE;
+    int band = gid / NAVE;
     float thS = uAve[s], thE = uAve[(s + 1) % NAVE];
     if (thE < thS) thE += TAU;
     ang = 0.5 * (thS + thE) + (h2(gid, 5) - 0.5) * 0.5;
+    G.nS = vec2(cos(thS), -sin(thS));
+    G.nE = vec2(cos(thE), -sin(thE));
+    G.r0 = band == 1 ? 1.3 : (band == 2 ? 2.3 : (band == 3 ? 5.5 : 17.5));
+    G.r1 = band == 1 ? 2.3 : (band == 2 ? 5.5 : (band == 3 ? 17.5 : 1e6));
   }
   G.eu = vec2(sin(ang), cos(ang));
   G.ev = vec2(cos(ang), -sin(ang));
   G.off = vec2(h2(gid, 8), h2(gid, 9)) * G.T;   // сдвиг фазы сетки: улицы прямые, без шумового изгиба
   return G;
+}
+bool inGrid(Grid G, vec2 p) {
+  float r = length(p);
+  if (r < G.r0 || r >= G.r1) return false;
+  return G.gid == 997 || (dot(p, G.nS) >= 0.0 && dot(p, G.nE) < 0.0);
 }
 // Расстояние до ближайшей «запретной» полосы: кольца, проспекты, река с набережными.
 float roadDist(vec2 c) {
@@ -253,8 +281,8 @@ vec3 cityColor(vec2 p, vec3 rd, float t) {
   // улицы: полосы box-фильтром, часть улиц выключена
   float sw = 0.011;
   // сила улицы: выключена (30 %), второстепенная (0.25) или главная (1); среднее 0.3625
-  float hV = h2(gid * 131 + int(floor(v / T + 0.5)), 3);
-  float hU = h2(gid * 137 + int(floor(u / T + 0.5)), 4);
+  float hV = th(gid * 131 + int(floor(v / T + 0.5)), 3).g;
+  float hU = th(gid * 137 + int(floor(u / T + 0.5)), 4).b;
   float onV = hV < 0.3 ? 0.0 : (hV > 0.75 ? 1.0 : 0.25);
   float onU = hU < 0.3 ? 0.0 : (hU > 0.75 ? 1.0 : 0.25);
   onV = mix(onV, 0.3625, smoothstep(0.35 * T, 1.0 * T, fwv));
@@ -273,23 +301,30 @@ vec3 cityColor(vec2 p, vec3 rd, float t) {
 
   // фонари: каждые 25 м вдоль улиц + на перекрёстках
   float s0 = 0.0024;
+#ifndef ABL_LAMPS
   float lamps = lightGrid(u, v, 0.025, T, fwu, fwv, s0) * onV
               + lightGrid(v, u, 0.025, T, fwv, fwu, s0) * onU
               + 1.6 * lightGrid(u, v, T, T, fwu, fwv, 0.003) * sqrt(onU * onV);
   col += lcol * 6.5 * lamps * lit;
+#endif
 
   // окна: слабая шумовая подсветка ячеек 18 м
+#ifndef ABL_WIN
   float wc = 0.018;
   float wn = vnoise(vec2(u, v) / wc + float(gid) * 13.1);
+#endif
+#ifndef ABL_WIN
   float win = mix(wn * wn, 0.296, smoothstep(0.25 * wc, 1.1 * wc, max(fwu, fwv)));
   vec3 wcol = mix(vec3(1.0, 0.62, 0.30), vec3(0.75, 0.85, 1.0), smoothstep(0.4, 0.7, n2));
   col += wcol * 0.05 * win * (1.0 - streets) * lit;
+#endif
 
   // редкие яркие «искры» вблизи
+#if !defined(ABL_WIN) && !defined(NO_SPARKS)
   if (uLod > 0.5) {
     vec2 cc = floor(vec2(u, v) / wc);
     ivec2 ic = ivec2(cc);
-    float hs = h2(ic.x + gid * 7919, ic.y);
+    float hs = fwIso < wc ? th(ic.x + gid * 7919, ic.y).a : 0.0;
     float spark = 0.0;
     float sp0 = 0.0016;
     if (hs > 0.975) {
@@ -301,8 +336,11 @@ vec3 cityColor(vec2 p, vec3 rd, float t) {
     spark = mix(spark, sparkAvg, smoothstep(0.3 * wc, 1.0 * wc, fwIso));
     col += vec3(1.0, 0.85, 0.65) * 7.0 * spark * (1.0 - streets) * lit;
   }
+#endif
 
-  // ---- вода: почти чёрная, отражение неба и огней набережной
+  // ---- вода: почти чёрная, отражение неба и огней набережной (считаем только рядом с рекой)
+  if (abs(rDist) < 0.14 + 3.0 * fwRn) {
+#ifndef ABL_WATER
   vec3 refl = skyBase(reflect(rd, vec3(0.0, 1.0, 0.0)));
   float fres = 0.04 + 0.96 * pow(1.0 - abs(rd.y), 5.0);
   vec3 wcolr = vec3(0.0006, 0.0009, 0.0022) + uBlue * 0.0012 + refl * fres * 0.6;
@@ -314,6 +352,7 @@ vec3 cityColor(vec2 p, vec3 rd, float t) {
   float reflGlow = exp(-max(bankDist, 0.0) / 0.018) * smoothstep(-0.002, 0.004, bankDist);
   wcolr += SODIUM * 0.20 * reflGlow * shimmer;
   col = mix(col, wcolr, water);
+#endif
 
   // набережные: дорога и цепочки фонарей по обоим берегам
   float embW = 0.007;
@@ -321,6 +360,7 @@ vec3 cityColor(vec2 p, vec3 rd, float t) {
   col += uGold * 0.35 * emb;
   float bankLamps = lightRow(p.x, abs(rDist) - 0.089, 0.03, fwA(vec2(1.0, 0.0)), fwRn, 0.0028);
   col += mix(SODIUM, uGold, 0.5) * 7.0 * bankLamps;
+  }
 
   // ---- кольцевые дороги
   float rings[4] = float[4](1.3, 2.3, 5.5, 17.5);
@@ -336,8 +376,10 @@ vec3 cityColor(vec2 p, vec3 rd, float t) {
     float circ = TAU * R;
     float Lc = circ / floor(circ / 0.05);
     float al = (a / TAU) * circ;
+#ifndef ABL_CARS
     col += uLight * 6.0 * carLane(al, d - 0.25 * w, Lc,  0.012, fwT, fwR, 0.0012, 40 + i);
     col += TAIL   * 4.5 * carLane(al, d + 0.25 * w, Lc, -0.012, fwT, fwR, 0.0012, 50 + i);
+#endif
   }
 
   // ---- радиальные проспекты (три ближайших)
@@ -355,8 +397,10 @@ vec3 cityColor(vec2 p, vec3 rd, float t) {
     float edges = lineBox(abs(ac) - 0.5 * w + 0.002, 0.004, fwac) * start;
     col += uGold * (0.10 * m + 1.0 * edges + 0.08 * halo(ac, 0.5 * w + 0.02, fwac) * start);
     // фары в одну сторону, стоп-сигналы — в другую
+#ifndef ABL_CARS
     col += uLight * 14.0 * carLane(al, ac - 0.0065, 0.045,  0.016, fwal, fwac, 0.0017, 10 + i) * start;
     col += TAIL   * 18.0 * carLane(al, ac + 0.0065, 0.045, -0.016, fwal, fwac, 0.0017, 30 + i) * start;
+#endif
   }
 
   // центр: площадь с мягким тёплым свечением
@@ -414,8 +458,8 @@ float traceBuildings(vec3 ro, vec3 rd, float tGround, out Hit hit) {
     vec2 cell = floor((o.xz + dl.xz * te) / T);
     vec2 cl = (cell + 0.5) * T;
     vec2 cw = G.eu * (cl.x - G.off.x) + G.ev * (cl.y - G.off.y);
-    int gc = gidAt(cw);
-    if (gc != G.gid) {
+    bool inG = inGrid(G, cw);
+    if (!inG) {
       // центр квартала в другой зоне — возможно, луч уже пересёк границу сетки
       int g = gidAt((ro + rd * te).xz);
       if (g != G.gid) {
@@ -424,7 +468,7 @@ float traceBuildings(vec3 ro, vec3 rd, float tGround, out Hit hit) {
         cell = floor((o.xz + dl.xz * te) / T);
         cl = (cell + 0.5) * T;
         cw = G.eu * (cl.x - G.off.x) + G.ev * (cl.y - G.off.y);
-        gc = gidAt(cw);
+        inG = inGrid(G, cw);
       }
     }
     float tu = ((dl.x > 0.0 ? cell.x + 1.0 : cell.x) * T - o.x) * inv.x;
@@ -434,12 +478,11 @@ float traceBuildings(vec3 ro, vec3 rd, float tGround, out Hit hit) {
     float ymin = min(ro.y + rd.y * tc, ro.y + rd.y * tx);
     float hcap = (rc < 2.3 ? 0.37 : min(0.27, (0.012 + 0.2 * exp(-rc / 1.6)) * 3.2)) * uBuild;
 
-    if (ymin < hcap && rc < 17.0 && gc == G.gid) {
-      float n1 = 0.6 * vnoise(cw * 0.45 + 3.1) + 0.4 * vnoise(cw * 1.15 - 7.3);
-      float park = smoothstep(0.31, 0.24, n1) * smoothstep(0.6, 1.2, rc);
-      float densF = smoothstep(0.18, 0.5, n1);
+    if (ymin < hcap && rc < 17.0 && inG) {
+      vec4 cd = textureLod(uCity, cw * (0.5 / CITY_EXT) + 0.5, 0.0);
+      float densF = cd.r, park = cd.g;
       if (park < 0.5 && densF > 0.12) {
-        float dR = roadDist(cw);
+        float dR = cd.b * 0.8 - 0.1;
         int cx = int(cell.x), cy = int(cell.y);
         float dcam = length(cw - ro.xz);
         float hs = uBuild * (1.0 - smoothstep(0.6 * Rfar, Rfar, dcam));
@@ -484,7 +527,7 @@ float traceBuildings(vec3 ro, vec3 rd, float tGround, out Hit hit) {
           vec2 lc = 0.5 * (lo + hi);
           float hd = 0.5 * length(hi - lo);
           float dLot = dR - length(lc - cl);
-          if (dR < T) dLot = roadDist(G.eu * (lc.x - G.off.x) + G.ev * (lc.y - G.off.y));
+          if (dR < T + 0.06) dLot = roadDist(G.eu * (lc.x - G.off.x) + G.ev * (lc.y - G.off.y));
           if (dLot < hd) continue;
           float tn; int f;
           if (boxHit(o, inv, vec3(lo.x, 0.0, lo.y), vec3(hi.x, H, hi.y), tc - 1e-4, tn, f) && tn < best) {
@@ -618,6 +661,17 @@ vec3 rayDir(vec2 fc) {
   return normalize(uCamF + (q.x * uCamR + q.y * uCamU) * uTanH);
 }
 
+#ifdef BAKE
+void main() {
+  vec2 p = (gl_FragCoord.xy * (1.0 / 1024.0) * 2.0 - 1.0) * CITY_EXT;
+  float r = length(p);
+  float n1 = 0.6 * vnoise(p * 0.45 + 3.1) + 0.4 * vnoise(p * 1.15 - 7.3);
+  float park = smoothstep(0.31, 0.24, n1) * smoothstep(0.6, 1.2, r);
+  float densF = smoothstep(0.18, 0.5, n1);
+  float dR = roadDist(p);
+  outColor = vec4(densF, park, clamp((dR + 0.1) / 0.8, 0.0, 1.0), n1);
+}
+#else
 void main() {
   vec2 fc = gl_FragCoord.xy;
   vec3 rd  = rayDir(fc);
@@ -625,7 +679,6 @@ void main() {
   vec3 rdy = rayDir(fc + vec2(0.0, 1.0));
   vec3 ro = uCamPos;
 
-  vec3 skyc = sky(rd);
   vec3 hz = skyBase(vec3(rd.x, 0.0, rd.z));
   float hy = abs(rdx.y - rd.y) + abs(rdy.y - rd.y);
   float gcov = clamp(0.5 - rd.y / max(hy, 1e-6), 0.0, 1.0);   // сглаженный горизонт
@@ -633,7 +686,11 @@ void main() {
   vec3 ground = hz;
   float tG = rd.y < -1e-5 ? min(-ro.y / rd.y, 400.0) : 400.0;
   Hit bhit;
+#ifndef ABL_BUILD
   float tb = traceBuildings(ro, rd, tG, bhit);
+#else
+  float tb = -1.0;
+#endif
   float H = 1.5;
   float hr = max(ro.y, 1e-3);
   vec3 haze = hz * 1.2 + vec3(0.010, 0.0085, 0.005);
@@ -656,7 +713,7 @@ void main() {
       ground = mix(c, haze, fog);
     }
   }
-  vec3 col = mix(skyc, ground, gcov);
+  vec3 col = gcov >= 1.0 ? ground : mix(sky(rd), ground, gcov);
 
   col *= uExpo;
 
@@ -685,4 +742,5 @@ void main() {
   srgb += (hashPix(fc) - 0.5) / 255.0;
   outColor = vec4(srgb, 1.0);
 }
+#endif
 `;

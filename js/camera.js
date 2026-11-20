@@ -67,6 +67,7 @@ export function createCameraRig(keys, { orbitAt = null, reducedMotion = false } 
   };
 
   let prog = 0, vel = 0, inited = false;
+  let motion = 1; // доля «живого» движения простоя (облёт, дыхание)
   const mouse = { x: 0, y: 0, pres: 0 };
   const omega = 3.0; // скорость пружины
 
@@ -85,9 +86,9 @@ export function createCameraRig(keys, { orbitAt = null, reducedMotion = false } 
     get progress() { return prog; },
     get moving() { return vel !== 0; },
     /**
-     * pointer: { x, y ∈ [-1, 1], present: 0|1 }; aspect = w/h
+     * pointer: { x, y ∈ [-1, 1], present: 0|1 }; aspect = w/h; calm — без облёта и «дыхания» (экономный режим)
      */
-    update(dt, time, target, pointer, aspect) {
+    update(dt, time, target, pointer, aspect, calm = false) {
       step(dt, target);
       const p = prog;
       // мышь: плавное следование τ = 0.45 с, «присутствие» τ = 0.6 с
@@ -99,20 +100,23 @@ export function createCameraRig(keys, { orbitAt = null, reducedMotion = false } 
       let x = ch.x(p), z = ch.z(p), h = HS * Math.sinh(ch.a(p));
       let yaw = ch.yaw(p), pitch = ch.pitch(p), fov = ch.fov(p);
 
-      if (!reducedMotion) {
+      // в экономном режиме облёт и «дыхание» плавно гаснут (τ ≈ 0.8 с), без скачка камеры
+      motion += ((calm ? 0 : 1) - motion) * (1 - Math.exp(-dt / 0.8));
+      if (Math.abs(motion - (calm ? 0 : 1)) < 1e-3) motion = calm ? 0 : 1;
+      if (!reducedMotion && motion > 0) {
         // медленный облёт вокруг центра около шага «Кольца»
         if (orbitAt !== null) {
           const w = Math.exp(-Math.pow((p - orbitAt) / 0.09, 2));
-          const da = 9 * Math.sin((time * Math.PI * 2) / 46) * w;
+          const da = 9 * Math.sin((time * Math.PI * 2) / 46) * w * motion;
           const c = Math.cos(da * DEG), s = Math.sin(da * DEG);
           const nx = x * c + z * s, nz = -x * s + z * c;
           x = nx; z = nz; yaw += da;
         }
         // «дыхание»: суммы синусов с несовпадающими периодами, ≈0.5°
         const T = time * Math.PI * 2;
-        yaw += 0.5 * (0.6 * Math.sin(T / 11) + 0.4 * Math.sin(T / 17.9 + 1.3));
-        pitch += 0.5 * (0.6 * Math.sin(T / 14.7 + 0.7) + 0.4 * Math.sin(T / 23.3 + 2.1));
-        h *= 1 + 0.006 * Math.sin(T / 17.9 + 0.4);
+        yaw += 0.5 * motion * (0.6 * Math.sin(T / 11) + 0.4 * Math.sin(T / 17.9 + 1.3));
+        pitch += 0.5 * motion * (0.6 * Math.sin(T / 14.7 + 0.7) + 0.4 * Math.sin(T / 23.3 + 2.1));
+        h *= 1 + 0.006 * motion * Math.sin(T / 17.9 + 0.4);
       }
       // параллакс ±3°
       yaw += 3 * mouse.x * mouse.pres;
@@ -144,7 +148,7 @@ export function createCameraRig(keys, { orbitAt = null, reducedMotion = false } 
         pos: [x, h, z], right: r, up, fwd,
         fovY: fov * DEG,
         tanH: Math.tan((fov * DEG) / 2),
-        settling: vel !== 0 || Math.abs(mouse.x - (pointer ? pointer.x : 0)) > 1e-4,
+        settling: vel !== 0 || Math.abs(mouse.x - (pointer ? pointer.x : 0)) > 1e-4 || (motion > 0 && motion < 1),
       };
     },
   };

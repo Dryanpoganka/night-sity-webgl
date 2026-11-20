@@ -1,7 +1,8 @@
 // Каркас WebGL2-сцены: полноэкранный шейдер, асинхронная сборка, размер холста с бюджетом,
-// рендер по требованию, пауза, восстановление контекста, адаптивное качество.
+// рендер по требованию, частота простоя, пауза, восстановление контекста, адаптивное качество
+// (разрешение и уровень деталей), переход на облегчённый шейдер.
 
-const VS = `#version 300 es
+export const VS = `#version 300 es
 in vec2 aPos;
 void main() { gl_Position = vec4(aPos, 0.0, 1.0); }`;
 
@@ -68,60 +69,106 @@ export function uniforms(gl, program, names) {
   return u;
 }
 
-function isSoftware(gl) {
-  const ext = gl.getExtension('WEBGL_debug_renderer_info');
-  const name = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
-  return /swiftshader|llvmpipe|software|basic render/i.test(String(name || ''));
+
+function rendererName(gl) {
+  try {
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    return String(gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER) || '');
+  } catch (e) {
+    return '';
+  }
 }
 
-// Контроллер адаптивного качества: медиана последних 40 кадров активной анимации.
-function createQuality(start) {
+// Профиль устройства: потолок DPR рендера, бюджет пикселей, стартовый масштаб.
+// Холст растягивается CSS-ом до размера окна (сглаженный апскейл браузера).
+function deviceProfile(renderer, mobile) {
+  const weak = /intel|iris|uhd|hd graphics|radeon\(tm\)|radeon graphics|vega|mali|adreno|powervr|apple gpu|videocore/i.test(renderer);
+  if (mobile) return { weak: true, dprCap: 1.25, budget: 0.45e6, start: 1, min: 0.5 };
+  if (weak) return { weak: true, dprCap: 1.5, budget: 1.6e6, start: 0.8, min: 0.5 };
+  return { weak: false, dprCap: 2, budget: 2.5e6, start: 1, min: 0.5 };
+}
+
+// Адаптивное качество по интервалам между кадрами.
+// - быстрая реакция вниз: медиана последних 10 кадров > 28 мс → масштаб × 0.8 сразу;
+// - медленная: медиана 40 кадров > slowMs (20 мс; на слабых устройствах 26 мс — им достаточно 38+ к/с) → × 0.85;
+// - вверх: медиана 40 < 12.5 мс, либо «упираемся в vsync» (< 17.6 мс) спустя 6 с после смены;
+//   если снижение случилось меньше чем через 10 с после повышения — это «пульсация», после двух таких
+//   повышений по vsync-правилу больше нет;
+// - интервалы > 150 мс не учитываются (троттлинг вкладки, переключение, разовый фриз);
+// - на минимальном масштабе и медиане > 40 мс дольше 3 с — сигнал перейти на облегчённый шейдер.
+export function createQuality(start, min, slowMs = 20) {
   const hist = [];
   let scale = start;
-  let lastDropAt = -1e9;
-  let drops = 0;
+  let lastChange = -1e9;
+  let lastUp = -1e9;
+  let osc = 0;
+  let slowSince = -1;
+  const drop = (k, now) => {
+    if (now - lastUp < 10000) osc++;
+    scale = Math.max(min, scale * k);
+    lastChange = now; hist.length = 0;
+  };
+  const median = (a) => {
+    const s = [...a].sort((x, y) => x - y);
+    const m = s.length >> 1;
+    return s.length % 2 ? s[m] : 0.5 * (s[m - 1] + s[m]);
+  };
   return {
     get scale() { return scale; },
-    reset() { hist.length = 0; },
+    reset(to) { hist.length = 0; slowSince = -1; if (to) scale = to; },
     push(ms, now) {
+      if (ms > 150) return null;
       hist.push(ms);
-      if (hist.length < 40) return false;
       if (hist.length > 40) hist.shift();
-      const med = [...hist].sort((a, b) => a - b)[20];
-      if (med > 24 && scale > 0.7) {
-        scale = Math.max(0.5, scale * 0.85);
-        lastDropAt = now; drops++; hist.length = 0;
-        return true;
+      if (hist.length >= 10) {
+        const m10 = median(hist.slice(-10));
+        if (m10 > 28 && scale > min + 1e-3 && now - lastChange > 300) {
+          drop(0.8, now);
+          return 'down';
+        }
+        if (scale <= min + 1e-3 && m10 > 40) {
+          if (slowSince < 0) slowSince = now;
+          else if (now - slowSince > 3000) { slowSince = -1; hist.length = 0; return 'lite'; }
+        } else if (m10 < 34) {
+          slowSince = -1;
+        }
       }
-      // Интервал кадра не опускается ниже периода vsync (16.7 мс на 60 Гц), поэтому порог 12.5 мс
-      // недостижим на обычном мониторе. Возврат вверх: < 12.5 мс, либо «упираемся в vsync»
-      // (< 17.6 мс) спустя 8 с после последнего снижения и не более двух раз — без пульсации.
-      const relaxed = med < 17.6 && now - lastDropAt > 8000 && drops <= 2;
-      if (scale < 1 && (med < 12.5 || relaxed)) {
-        scale = Math.min(1, scale / 0.85);
-        hist.length = 0;
-        return true;
+      if (hist.length >= 40) {
+        const m40 = median(hist);
+        if (m40 > slowMs && scale > min + 1e-3) {
+          drop(0.85, now);
+          return 'down';
+        }
+        const relaxed = m40 < 17.6 && now - lastChange > 6000 && osc < 2;
+        if (scale < 1 && (m40 < 12.5 || relaxed)) {
+          scale = Math.min(1, scale / 0.85);
+          lastChange = now; lastUp = now; hist.length = 0;
+          return 'up';
+        }
       }
-      return false;
+      return null;
     },
   };
 }
 
 /**
- * create(canvas, options) → { ok, setProgress, setPaused, resize, invalidate, destroy, state }
- * options: { fragment, uniformNames[], render(gl, u, time, dt, state) → bool (нужен ещё кадр),
- *            onFallback(on: bool, reason), onReady(), mobile, reducedMotion }
+ * create(canvas, options) → { ok, state, gl, setProgress, setPaused, setFragment, resize, invalidate, destroy }
+ * options:
+ *   fragment, uniformNames[]
+ *   render(gl, u, time, dt, state) → bool — кадр «занят» (камера едет, курсор, вспышка)
+ *   idleFps(state) → 0 | 30 | 60 — частота кадров, когда сцена «не занята» (0 — не рисовать)
+ *   onFallback(on, reason), onLite(), onReady(), hooks { before(gl), after(gl, now) }, mobile, reducedMotion
  */
 export function create(canvas, options) {
   const opts = Object.assign({ mobile: false, reducedMotion: false }, options);
-  const state = { progress: 0, scale: 1, lod: 1, width: 1, height: 1, cssW: 1, cssH: 1 };
+  const state = { progress: 0, scale: 1, lod: 2, width: 1, height: 1, cssW: 1, cssH: 1, tier: 'full', renderer: '', weak: false };
   const cleanups = [];
   const on = (t, type, fn, o) => { t.addEventListener(type, fn, o); cleanups.push(() => t.removeEventListener(type, fn, o)); };
 
   const noop = () => {};
   const failApi = (reason) => {
     opts.onFallback && opts.onFallback(true, reason);
-    return { ok: false, reason, state, setProgress: noop, setPaused: noop, resize: noop, invalidate: noop, destroy: noop };
+    return { ok: false, reason, state, setProgress: noop, setPaused: noop, setFragment: noop, resize: noop, invalidate: noop, destroy: noop };
   };
 
   const gl = canvas.getContext('webgl2', {
@@ -129,26 +176,37 @@ export function create(canvas, options) {
     premultipliedAlpha: false, preserveDrawingBuffer: false, powerPreference: 'high-performance',
   });
   if (!gl) return failApi('no-webgl2');
-  if (isSoftware(gl)) return failApi('software-renderer');
+  state.renderer = rendererName(gl);
+  if (/swiftshader|llvmpipe|software|basic render/i.test(state.renderer)) return failApi('software-renderer');
 
-  const quality = createQuality(opts.mobile ? 0.8 : 1);
+  const prof = deviceProfile(opts.forceWeak ? 'intel' : state.renderer, opts.mobile);
+  state.weak = prof.weak;
+  const quality = createQuality(prof.start, prof.min, prof.weak ? 26 : 20);
+  let fragment = opts.fragment;
   let prog = null, vao = null, buf = null, u = null;
   let ready = false, lost = false, destroyed = false;
   let paused = false, offscreen = false;
-  let raf = 0, last = 0, time = 0, consecutive = false, dirty = true;
+  let raf = 0, last = 0, lastRender = 0, time = 0, consecutive = false, dirty = true, busy = true;
+
+  async function build(src) {
+    const p = await createProgram(gl, VS, src);
+    if (destroyed || gl.isContextLost()) { gl.deleteProgram(p); return false; }
+    if (prog) gl.deleteProgram(prog);
+    prog = p;
+    u = uniforms(gl, prog, opts.uniformNames || []);
+    return true;
+  }
 
   async function init() {
     ready = false;
     try {
-      prog = await createProgram(gl, VS, opts.fragment);
+      if (!(await build(fragment))) return;
     } catch (e) {
       if (gl.isContextLost()) return;
       console.error(e.message);
       opts.onFallback && opts.onFallback(true, 'shader-error');
       return;
     }
-    if (destroyed || gl.isContextLost()) return;
-    u = uniforms(gl, prog, opts.uniformNames || []);
     vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
     buf = gl.createBuffer();
@@ -158,7 +216,7 @@ export function create(canvas, options) {
     gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
     ready = true;
     resize();
-    opts.onReady && opts.onReady();
+    opts.onReady && opts.onReady(gl);
     opts.onFallback && opts.onFallback(false);
     wake();
   }
@@ -166,11 +224,9 @@ export function create(canvas, options) {
   function resize() {
     const r = canvas.getBoundingClientRect();
     const cssW = Math.max(1, r.width), cssH = Math.max(1, r.height);
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    let k = dpr * quality.scale;
-    const budget = opts.mobile ? 1.9e6 : 4.6e6;
-    if (cssW * cssH * k * k > budget) k = Math.sqrt(budget / (cssW * cssH));
-    k = Math.max(k, 0.5);
+    const dpr = Math.min(window.devicePixelRatio || 1, prof.dprCap);
+    let k = Math.min(dpr, Math.sqrt(prof.budget / (cssW * cssH))) * quality.scale;
+    k = Math.max(k, 0.35);
     const w = Math.round(cssW * k), h = Math.round(cssH * k);
     state.cssW = cssW; state.cssH = cssH;
     if (w !== canvas.width || h !== canvas.height) {
@@ -178,9 +234,29 @@ export function create(canvas, options) {
     }
     state.width = w; state.height = h;
     state.scale = quality.scale;
-    state.lod = quality.scale < 0.8 ? 0 : 1;
+    state.lod = quality.scale >= 0.8 ? 2 : (quality.scale >= 0.6 ? 1 : 0);
     dirty = true;
     wake();
+  }
+
+  async function goLite() {
+    if (state.tier !== 'full') {
+      // и облегчённый шейдер не тянет — статичный запасной вид
+      state.tier = 'static';
+      opts.onFallback && opts.onFallback(true, 'too-slow');
+      paused = true;
+      return;
+    }
+    state.tier = 'lite';
+    const src = opts.onLite && opts.onLite();
+    if (!src) return;
+    try {
+      await build(src);
+      quality.reset(0.75);
+      resize();
+    } catch (e) {
+      console.error(e.message);
+    }
   }
 
   const canRun = () => ready && !lost && !destroyed && !paused && !offscreen && !document.hidden;
@@ -189,29 +265,43 @@ export function create(canvas, options) {
     raf = 0;
     if (!canRun()) { consecutive = false; return; }
     const rawMs = now - last;
-    const dt = consecutive ? Math.min(rawMs / 1000, 0.05) : 1 / 60;
     last = now;
-    if (!opts.reducedMotion) time += dt;
     if (consecutive && !opts.reducedMotion) {
-      if (quality.push(rawMs, now)) resize();
+      const r = quality.push(rawMs, now);
+      if (r === 'down' || r === 'up') resize();
+      else if (r === 'lite') goLite();
     }
+    // простой: реже или вовсе не рисуем
+    const fps = opts.reducedMotion ? 0 : (opts.idleFps ? opts.idleFps(state) : 60);
+    if (!dirty && !busy) {
+      if (fps <= 0) { consecutive = false; return; }
+      if (fps < 60 && now - lastRender < 1000 / fps - 4) {
+        consecutive = true;
+        raf = requestAnimationFrame(frame);
+        return;
+      }
+    }
+    const dt = lastRender && now - lastRender < 200 ? Math.min((now - lastRender) / 1000, 0.05) : 1 / 60;
+    lastRender = now;
+    if (!opts.reducedMotion && (fps > 0 || busy || dirty)) time += dt;
     gl.viewport(0, 0, canvas.width, canvas.height);
     gl.useProgram(prog);
     gl.bindVertexArray(vao);
-    const more = opts.render(gl, u, time, dt, state);
+    busy = !!opts.render(gl, u, time, dt, state);
+    if (opts.hooks && opts.hooks.before) opts.hooks.before(gl);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+    if (opts.hooks && opts.hooks.after) opts.hooks.after(gl, now);
     dirty = false;
-    if (!opts.reducedMotion || more) {
-      consecutive = true;
-      raf = requestAnimationFrame(frame);
-    } else {
+    if ((opts.reducedMotion || fps <= 0) && !busy) {
       consecutive = false;
+      return;
     }
+    consecutive = true;
+    raf = requestAnimationFrame(frame);
   }
 
   function wake() {
     if (raf || !canRun()) return;
-    if (!dirty && opts.reducedMotion) return;
     consecutive = false;
     last = performance.now();
     raf = requestAnimationFrame(frame);
@@ -234,6 +324,7 @@ export function create(canvas, options) {
     lost = true; ready = false;
     if (raf) cancelAnimationFrame(raf);
     raf = 0;
+    prog = null; vao = null; buf = null;
     opts.onFallback && opts.onFallback(true, 'context-lost');
   });
   on(canvas, 'webglcontextrestored', () => {
@@ -246,10 +337,29 @@ export function create(canvas, options) {
   return {
     ok: true,
     state,
+    gl,
     setProgress(p) { state.progress = p; invalidate(); },
     setPaused(b) { paused = !!b; if (!paused) invalidate(); },
+    // заменить фрагментный шейдер (например, облегчённый вариант)
+    async setFragment(src) { fragment = src; if (ready) { await build(src); invalidate(); } },
     resize,
     invalidate,
+    // Отладка: n раз рисует последний кадр с синхронизацией, возвращает среднее время, мс.
+    drawSync(n = 20) {
+      if (!ready) return -1;
+      const px = new Uint8Array(4);
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.useProgram(prog);
+      gl.bindVertexArray(vao);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      const t0 = performance.now();
+      for (let i = 0; i < n; i++) {
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      }
+      return (performance.now() - t0) / n;
+    },
     destroy() {
       destroyed = true;
       if (raf) cancelAnimationFrame(raf);
